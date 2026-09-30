@@ -51,5 +51,6 @@ jobs:
           name: PhotoViewer-${{ matrix.name }}
           path: |
             build/PhotoViewer
+            build/PhotoViewer.app
             build/Release/PhotoViewer.exe
           if-no-files-found: error

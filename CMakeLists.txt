@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.28)
 project(PhotoViewer LANGUAGES C CXX)
 if(APPLE)
     enable_language(OBJC OBJCXX)
@@ -18,7 +18,8 @@ set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(raylib
     GIT_REPOSITORY https://github.com/raysan5/raylib.git
     GIT_TAG 6.0
-    GIT_SHALLOW TRUE)
+    GIT_SHALLOW TRUE
+    EXCLUDE_FROM_ALL)  # keep raylib's install rules out of `cmake --install`
 
 # --- Dear ImGui (docking) -----------------------------------------------------
 FetchContent_Declare(imgui
@@ -47,16 +48,25 @@ target_include_directories(imgui_rl PUBLIC ${imgui_SOURCE_DIR} ${rlimgui_SOURCE_
 target_compile_definitions(imgui_rl PUBLIC NO_FONT_AWESOME)
 target_link_libraries(imgui_rl PUBLIC raylib)
 
-add_executable(PhotoViewer
+add_executable(PhotoViewer MACOSX_BUNDLE
     src/main.cpp
     src/image_doc.cpp
     src/exif.cpp)
 if(APPLE)
-    target_sources(PhotoViewer PRIVATE src/mac_gestures.mm)
+    target_sources(PhotoViewer PRIVATE src/mac_platform.mm)
+    set_target_properties(PhotoViewer PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/cmake/Info.plist.in
+        MACOSX_BUNDLE_GUI_IDENTIFIER com.michalpelka.photoviewer
+        MACOSX_BUNDLE_SHORT_VERSION_STRING 0.1.0
+        MACOSX_BUNDLE_BUNDLE_VERSION 1)
 else()
-    file(WRITE ${CMAKE_BINARY_DIR}/mac_gestures_stub.cpp
-        "#include \"mac_gestures.hpp\"\nvoid macInstallGestures() {}\nfloat macConsumeMagnify() { return 0; }\n")
-    target_sources(PhotoViewer PRIVATE ${CMAKE_BINARY_DIR}/mac_gestures_stub.cpp)
+    file(WRITE ${CMAKE_BINARY_DIR}/mac_platform_stub.cpp
+        "#include \"mac_platform.hpp\"\n"
+        "void macInstallOpenHandler() {}\n"
+        "std::vector<std::string> macTakeOpenedFiles() { return {}; }\n"
+        "void macInstallGestures() {}\n"
+        "float macConsumeMagnify() { return 0; }\n")
+    target_sources(PhotoViewer PRIVATE ${CMAKE_BINARY_DIR}/mac_platform_stub.cpp)
     target_include_directories(PhotoViewer PRIVATE src)
 endif()
 target_link_libraries(PhotoViewer PRIVATE imgui_rl raylib ${OpenCV_LIBS})
@@ -66,3 +76,9 @@ endif()
 if(APPLE)
     target_link_libraries(PhotoViewer PRIVATE "-framework IOKit" "-framework Cocoa" "-framework OpenGL")
 endif()
+
+# `sudo cmake --install build` -> /Applications/PhotoViewer.app on macOS, <prefix>/bin elsewhere.
+set(PHOTOVIEWER_MACOS_APP_DIR "/Applications" CACHE PATH "Where the macOS .app bundle is installed")
+install(TARGETS PhotoViewer
+    BUNDLE DESTINATION ${PHOTOVIEWER_MACOS_APP_DIR}
+    RUNTIME DESTINATION bin)

@@ -2,7 +2,7 @@
 // raylib (OpenGL) + Dear ImGui (docking) + OpenCV decoding.
 
 #include "image_doc.hpp"
-#include "mac_gestures.hpp"
+#include "mac_platform.hpp"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -104,7 +104,11 @@ std::string fmtBytes(double n)
 
 std::string fmtTime(fs::file_time_type t)
 {
+#ifdef _MSC_VER
+    auto sys = std::chrono::clock_cast<std::chrono::system_clock>(t);
+#else
     auto sys = std::chrono::file_clock::to_sys(t);
+#endif
     std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::time_point_cast<std::chrono::system_clock::duration>(sys));
     std::tm tm{};
 #ifdef _WIN32
@@ -1084,11 +1088,18 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         if (s == "--shot" && i + 1 < argc) shotPath = argv[++i];
-        else initial.push_back(s);
+        else if (s.rfind("-psn_", 0) == 0) continue;  // old macOS Finder launch argument
+        else {
+            // Resolve now: inside an .app bundle GLFW changes the working directory to Resources/.
+            std::error_code ec;
+            fs::path abs = fs::absolute(s, ec);
+            initial.push_back(ec ? s : abs.string());
+        }
     }
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI | FLAG_VSYNC_HINT);
     SetTraceLogLevel(LOG_WARNING);
+    macInstallOpenHandler();  // before InitWindow: the launch "open file" event arrives during glfwInit
     InitWindow(1600, 1000, "PhotoViewer");
     {
         // macOS silently shrinks windows taller than the screen, but raylib keeps the requested
@@ -1132,6 +1143,7 @@ int main(int argc, char** argv)
             UnloadDroppedFiles(list);
             addPaths(a, paths);
         }
+        if (auto opened = macTakeOpenedFiles(); !opened.empty()) addPaths(a, opened);
         pollDocs(a);
         a.pinch = macConsumeMagnify();
         watchFiles(a);

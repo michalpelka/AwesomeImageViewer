@@ -12,6 +12,18 @@ cmake --build build -j
 
 Requires OpenCV (`brew install opencv`). raylib, ImGui and rlImGui are fetched by CMake.
 
+## Install as default image viewer (macOS)
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+sudo cmake --install build          # -> /Applications/PhotoViewer.app
+scripts/macos-set-default.sh        # as your user, not sudo; add --dry-run to preview
+```
+
+Double-clicking an image (or Open With) then opens it in PhotoViewer; opening more files while it runs adds them to the list.
+The app links Homebrew's OpenCV, so rebuild + reinstall after an OpenCV major upgrade.
+HEIC and camera RAW stay with Preview (OpenCV usually can't decode them).
+
 ## Features
 
 - Drag & drop multiple files or folders; dropping an already open file reloads it.
