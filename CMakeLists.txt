@@ -53,8 +53,10 @@ add_executable(PhotoViewer MACOSX_BUNDLE
     src/image_doc.cpp
     src/exif.cpp)
 if(APPLE)
-    target_sources(PhotoViewer PRIVATE src/mac_platform.mm)
+    target_sources(PhotoViewer PRIVATE src/mac_platform.mm cmake/AppIcon.icns)  # icon: scripts/make_icon.py
+    set_source_files_properties(cmake/AppIcon.icns PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
     set_target_properties(PhotoViewer PROPERTIES
+        MACOSX_BUNDLE_ICON_FILE AppIcon.icns
         MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/cmake/Info.plist.in
         MACOSX_BUNDLE_GUI_IDENTIFIER com.michalpelka.photoviewer
         MACOSX_BUNDLE_SHORT_VERSION_STRING 0.1.0

@@ -17,10 +17,22 @@ Requires OpenCV (`brew install opencv`). raylib, ImGui and rlImGui are fetched b
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 sudo cmake --install build          # -> /Applications/PhotoViewer.app
-scripts/macos-set-default.sh        # as your user, not sudo; add --dry-run to preview
+scripts/macos-set-default.sh        # as your user, not sudo; --dry-run previews, --restore undoes
 ```
 
 Double-clicking an image (or Open With) then opens it in PhotoViewer; opening more files while it runs adds them to the list.
+
+### Going back to Preview
+
+```sh
+scripts/macos-set-default.sh --restore
+```
+
+This restores whatever each type opened with before (saved in `~/Library/Application Support/PhotoViewer/previous-defaults.tsv`), or Preview if nothing was saved.
+
+Manually, per file type: in Finder select an image → **Get Info** (⌘I) → **Open with:** choose **Preview** → **Change All…**. Repeat for each extension (JPEG, PNG, TIFF, …).
+
+To remove the app completely: restore defaults first, then `sudo rm -rf /Applications/PhotoViewer.app`.
 The app links Homebrew's OpenCV, so rebuild + reinstall after an OpenCV major upgrade.
 HEIC and camera RAW stay with Preview (OpenCV usually can't decode them).
 
