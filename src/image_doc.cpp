@@ -3,8 +3,10 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <iterator>
 
 namespace {
 

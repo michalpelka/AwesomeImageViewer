@@ -11,8 +11,12 @@
 #include <rlgl.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <string>
@@ -103,7 +107,11 @@ std::string fmtTime(fs::file_time_type t)
     auto sys = std::chrono::file_clock::to_sys(t);
     std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::time_point_cast<std::chrono::system_clock::duration>(sys));
     std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
     localtime_r(&tt, &tm);
+#endif
     char b[64];
     std::strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", &tm);
     return b;
@@ -114,6 +122,25 @@ std::string shellQuote(const std::string& s)
     std::string r = "'";
     for (char c : s) r += c == '\'' ? std::string("'\\''") : std::string(1, c);
     return r + "'";
+}
+
+#if defined(__APPLE__)
+constexpr const char* kRevealLabel = "Reveal in Finder";
+#elif defined(_WIN32)
+constexpr const char* kRevealLabel = "Show in Explorer";
+#else
+constexpr const char* kRevealLabel = "Open containing folder";
+#endif
+
+void revealInFileManager(const std::string& path)
+{
+#if defined(__APPLE__)
+    std::system(("open -R " + shellQuote(path)).c_str());
+#elif defined(_WIN32)
+    std::system(("explorer /select,\"" + path + "\"").c_str());
+#else
+    std::system(("xdg-open " + shellQuote(fs::path(path).parent_path().string()) + " &").c_str());
+#endif
 }
 
 ImU32 channelColor(int channels, int i, int alpha = 255)
@@ -839,7 +866,7 @@ void drawFilesTab(App& a)
         if (ImGui::BeginPopupContextItem()) {
             if (ImGui::MenuItem("Reload")) a.loader->enqueue(a.docs[i], a.disp);
             if (ImGui::MenuItem("Copy path")) ImGui::SetClipboardText(d.path.c_str());
-            if (ImGui::MenuItem("Reveal in Finder")) std::system(("open -R " + shellQuote(d.path)).c_str());
+            if (ImGui::MenuItem(kRevealLabel)) revealInFileManager(d.path);
             if (ImGui::MenuItem("Close")) toClose = i;
             ImGui::EndPopup();
         }
@@ -899,7 +926,7 @@ void drawMenuBar(App& a)
         ImGui::Separator();
         if (ImGui::MenuItem("Copy path", nullptr, false, d)) ImGui::SetClipboardText(d->path.c_str());
         if (ImGui::MenuItem("Copy metadata", nullptr, false, d && d->data)) ImGui::SetClipboardText(metadataText(*d).c_str());
-        if (ImGui::MenuItem("Reveal in Finder", nullptr, false, d)) std::system(("open -R " + shellQuote(d->path)).c_str());
+        if (ImGui::MenuItem(kRevealLabel, nullptr, false, d)) revealInFileManager(d->path);
         ImGui::Separator();
         if (ImGui::MenuItem("Close", "Del", false, d)) closeDoc(a, a.current);
         if (ImGui::MenuItem("Close all", nullptr, false, !a.docs.empty()))
@@ -1046,7 +1073,11 @@ void buildDefaultLayout(ImGuiID dock)
 
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    if (!std::getenv("OPENCV_IO_ENABLE_OPENEXR")) _putenv_s("OPENCV_IO_ENABLE_OPENEXR", "1");
+#else
     setenv("OPENCV_IO_ENABLE_OPENEXR", "1", 0);
+#endif
 
     std::vector<std::string> initial;
     std::string shotPath;  // --shot out.png: render a few frames, save a screenshot and exit (for testing)
