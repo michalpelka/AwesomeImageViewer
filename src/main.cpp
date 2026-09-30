@@ -34,6 +34,7 @@ struct View {
     double cx = 0, cy = 0;  // image coordinate at canvas centre
     float scale = 1;        // screen points per image pixel
     bool fitted = false;
+    bool autoFit = true;    // scale tracks canvas size (e.g. window resize) until a manual zoom/pan
 };
 
 struct App {
@@ -45,7 +46,11 @@ struct App {
     ImVec2 canvasSize{1, 1};
 
     bool showLoupe = true, showGrid = true, showValues = true;
-    bool scrollPans = true;  // trackpad: scroll pans, pinch / Cmd+scroll zooms
+#if defined(__APPLE__)
+    bool scrollPans = true;   // trackpad: scroll pans, pinch / Cmd+scroll zooms
+#else
+    bool scrollPans = false;  // plain mouse wheel zooms at cursor; Ctrl+scroll pans
+#endif
     float pinch = 0;         // magnification accumulated this frame (macOS)
     bool keepView = true, autoReload = true, histLog = false, showDemo = false;
     int loupePixels = 15;
@@ -363,6 +368,7 @@ void fitView(App& a, int w, int h)
     a.view.cx = w * 0.5;
     a.view.cy = h * 0.5;
     a.view.fitted = true;
+    a.view.autoFit = true;
 }
 
 void zoomAt(App& a, ImVec2 canvasCenter, ImVec2 screen, float newScale)
@@ -373,6 +379,7 @@ void zoomAt(App& a, ImVec2 canvasCenter, ImVec2 screen, float newScale)
     a.view.scale = newScale;
     a.view.cx = ix - (screen.x - canvasCenter.x) / newScale;
     a.view.cy = iy - (screen.y - canvasCenter.y) / newScale;
+    a.view.autoFit = false;
 }
 
 // ----------------------------------------------------------------------------
@@ -541,6 +548,7 @@ void drawViewer(App& a)
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImVec2 avail = ImGui::GetContentRegionAvail();
     ImVec2 csz(std::max(avail.x, 32.0f), std::max(avail.y, 32.0f));
+    const bool canvasResized = csz.x != a.canvasSize.x || csz.y != a.canvasSize.y;
     a.canvasSize = csz;
     const ImVec2 p1(p0.x + csz.x, p0.y + csz.y);
     const ImVec2 cc(p0.x + csz.x * 0.5f, p0.y + csz.y * 0.5f);
@@ -569,7 +577,7 @@ void drawViewer(App& a)
         ensureDisplaySettings(a, *d);
         const cv::Mat& mat = d->data->mat;
         const int W = mat.cols, H = mat.rows;
-        if (!a.view.fitted) fitView(a, W, H);
+        if (!a.view.fitted || (a.view.autoFit && canvasResized)) fitView(a, W, H);
 
         auto toScreen = [&](double ix, double iy) {
             return ImVec2(float(cc.x + (ix - a.view.cx) * a.view.scale), float(cc.y + (iy - a.view.cy) * a.view.scale));
@@ -586,6 +594,7 @@ void drawViewer(App& a)
                 // Two-finger trackpad scroll: GLFW reports ~10 points of finger travel per unit.
                 a.view.cx -= io.MouseWheelH * 10.0 / a.view.scale;
                 a.view.cy -= io.MouseWheel * 10.0 / a.view.scale;
+                a.view.autoFit = false;
             } else if (io.MouseWheel != 0) {
                 zoomAt(a, cc, io.MousePos, a.view.scale * std::pow(1.2f, io.MouseWheel));
             }
@@ -594,6 +603,7 @@ void drawViewer(App& a)
         if (active && !a.roiDragging && (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 1)) && !io.KeyAlt) {
             a.view.cx -= io.MouseDelta.x / a.view.scale;
             a.view.cy -= io.MouseDelta.y / a.view.scale;
+            a.view.autoFit = false;
         }
         if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) fitView(a, W, H);
 
@@ -944,7 +954,7 @@ void drawMenuBar(App& a)
         const char* zl[] = {"100%", "200%", "400%", "800%"};
         const char* zk[] = {"1", "2", "3", "4"};
         for (int i = 0; i < 4; ++i)
-            if (ImGui::MenuItem(zl[i], zk[i])) { a.view.scale = float(1 << i) / dpiScale(); a.view.fitted = true; }
+            if (ImGui::MenuItem(zl[i], zk[i])) { a.view.scale = float(1 << i) / dpiScale(); a.view.fitted = true; a.view.autoFit = false; }
         ImGui::Separator();
         ImGui::MenuItem("Normalize min..max", "N", &a.disp.normalize);
         if (ImGui::BeginMenu("Channel")) {
@@ -993,8 +1003,13 @@ void drawMenuBar(App& a)
     if (ImGui::BeginMenu("Help")) {
         const char* lines[] = {
             "Drop files or folders onto the window",
+#if defined(__APPLE__)
             "Two-finger scroll    pan",
             "Pinch / Cmd+scroll   zoom",
+#else
+            "Scroll               zoom at cursor",
+            "Ctrl+scroll          pan",
+#endif
             "Drag                 pan",
             "Double-click / F     fit",
             "Hold Shift           loupe",
@@ -1042,7 +1057,7 @@ void handleShortcuts(App& a)
     if (pressed(ImGuiKey_F) || pressed(ImGuiKey_0)) a.view.fitted = false;
     const ImGuiKey zk[] = {ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4};
     for (int i = 0; i < 4; ++i)
-        if (pressed(zk[i])) { a.view.scale = float(1 << i) / dpiScale(); a.view.fitted = true; }
+        if (pressed(zk[i])) { a.view.scale = float(1 << i) / dpiScale(); a.view.fitted = true; a.view.autoFit = false; }
     if (pressed(ImGuiKey_Equal, true) || pressed(ImGuiKey_KeypadAdd, true)) zoomAt(a, cc, cc, a.view.scale * 1.25f);
     if (pressed(ImGuiKey_Minus, true) || pressed(ImGuiKey_KeypadSubtract, true)) zoomAt(a, cc, cc, a.view.scale / 1.25f);
     if (pressed(ImGuiKey_N)) a.disp.normalize = !a.disp.normalize;

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=PhotoViewer
+Comment=raylib/ImGui image inspector with OpenCV loading
+Exec=@PHOTOVIEWER_BIN@ %F
+TryExec=@PHOTOVIEWER_BIN@
+Icon=photoviewer
+Terminal=false
+Categories=Graphics;Viewer;Photography;
+MimeType=image/jpeg;image/png;image/tiff;image/bmp;image/webp;image/gif;image/x-exr;image/x-portable-bitmap;image/jp2;image/avif;
+StartupNotify=true
