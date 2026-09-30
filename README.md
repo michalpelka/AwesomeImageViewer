@@ -85,8 +85,9 @@ The right sidebar (~10% width) has three tabs: **Info** (pixel readout, histogra
 
 | Input | Action |
 |---|---|
-| Two-finger scroll | pan |
-| Pinch, ⌘/Ctrl + scroll | zoom at cursor (untick "Scroll pans" for plain mouse-wheel zoom) |
+| Scroll (Linux/Windows) | zoom at cursor; Ctrl+scroll pans |
+| Two-finger scroll (macOS) | pan; Pinch / ⌘+scroll zooms |
+| View → Scroll pans (trackpad) | flips which of the two above scroll does |
 | Hold Shift | loupe |
 | Left / middle drag | pan |
 | Double-click, `F`, `0` | fit |

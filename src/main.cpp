@@ -45,7 +45,11 @@ struct App {
     ImVec2 canvasSize{1, 1};
 
     bool showLoupe = true, showGrid = true, showValues = true;
-    bool scrollPans = true;  // trackpad: scroll pans, pinch / Cmd+scroll zooms
+#if defined(__APPLE__)
+    bool scrollPans = true;   // trackpad: scroll pans, pinch / Cmd+scroll zooms
+#else
+    bool scrollPans = false;  // plain mouse wheel zooms at cursor; Ctrl+scroll pans
+#endif
     float pinch = 0;         // magnification accumulated this frame (macOS)
     bool keepView = true, autoReload = true, histLog = false, showDemo = false;
     int loupePixels = 15;
@@ -993,8 +997,13 @@ void drawMenuBar(App& a)
     if (ImGui::BeginMenu("Help")) {
         const char* lines[] = {
             "Drop files or folders onto the window",
+#if defined(__APPLE__)
             "Two-finger scroll    pan",
             "Pinch / Cmd+scroll   zoom",
+#else
+            "Scroll               zoom at cursor",
+            "Ctrl+scroll          pan",
+#endif
             "Drag                 pan",
             "Double-click / F     fit",
             "Hold Shift           loupe",
