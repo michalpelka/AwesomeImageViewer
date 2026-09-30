@@ -36,6 +36,35 @@ To remove the app completely: restore defaults first, then `sudo rm -rf /Applica
 The app links Homebrew's OpenCV, so rebuild + reinstall after an OpenCV major upgrade.
 HEIC and camera RAW stay with Preview (OpenCV usually can't decode them).
 
+## Install as default image viewer (Ubuntu / Linux)
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+sudo cmake --install build              # -> /usr/local/bin/PhotoViewer + .desktop entry + icon
+scripts/linux-set-default.sh            # as your user, not sudo; --dry-run previews, --restore undoes
+```
+
+This registers `photoviewer.desktop` via `xdg-mime` for common image MIME types (JPEG, PNG, TIFF, BMP,
+WebP, GIF, OpenEXR, PBM, JPEG 2000, AVIF), so double-click / "Open With" in your file manager opens
+PhotoViewer; opening more files while it runs adds them to the list. Requires `xdg-utils` (usually
+already installed).
+
+### Going back to the previous default
+
+```sh
+scripts/linux-set-default.sh --restore
+```
+
+This restores whatever each MIME type opened with before (saved in
+`~/.local/share/photoviewer/previous-defaults.tsv`); types with no saved default are left alone.
+
+Manually, per file type: right-click an image in your file manager → **Open With** / **Properties** →
+pick the app → **Set as default**.
+
+To remove the app completely: restore defaults first, then delete `/usr/local/bin/PhotoViewer`,
+`/usr/local/share/applications/photoviewer.desktop` and `/usr/local/share/pixmaps/photoviewer.png`
+(or wherever `CMAKE_INSTALL_PREFIX` pointed).
+
 ## Features
 
 - Drag & drop multiple files or folders; dropping an already open file reloads it.
