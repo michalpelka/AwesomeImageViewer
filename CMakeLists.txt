@@ -35,7 +35,7 @@ FetchContent_Declare(rlimgui
 
 FetchContent_MakeAvailable(raylib imgui rlimgui)
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs video)
 
 add_library(imgui_rl STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp

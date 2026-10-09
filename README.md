@@ -46,6 +46,8 @@ HEIC and camera RAW stay with Preview (OpenCV usually can't decode them).
 - Metadata: file info, image type/memory, EXIF (camera, exposure, GPS) from JPEG/TIFF/DNG/PNG/WebP.
 - Auto-reload when files change on disk, so it can stay open next to a pipeline that writes outputs.
 - Shared view when switching images, for flicker comparison of processing stages.
+- Blend: with exactly two images open, cross-fade between them with a slider.
+- Optical flow (OpenCV Farneback) from the previous image in the list to the current one: overlay showing direction (hue, with a colour-wheel legend) or magnitude (Turbo colormap with a px colour bar; auto 99th-percentile or manual range), arrows with adjustable length and spacing, and the flow vector under the cursor in the Info tab.
 
 ## Layout
 
@@ -68,6 +70,8 @@ The right sidebar (~10% width) has three tabs: **Info** (pixel readout, histogra
 | `←` `→` / Space / Backspace | previous / next image |
 | `N` | normalize min..max |
 | `C` | cycle channel All/R/G/B/A |
+| `B` | blend the two open images (only with exactly two) |
+| `O` | optical flow from the previous image |
 | `G` `V` | toggle grid / cell values |
 | `R` | reload, `Delete` closes |
 | `F1` | ImGui demo |
