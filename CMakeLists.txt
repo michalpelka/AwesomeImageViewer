@@ -84,3 +84,22 @@ set(PHOTOVIEWER_MACOS_APP_DIR "/Applications" CACHE PATH "Where the macOS .app b
 install(TARGETS PhotoViewer
     BUNDLE DESTINATION ${PHOTOVIEWER_MACOS_APP_DIR}
     RUNTIME DESTINATION bin)
+
+if(UNIX AND NOT APPLE)
+    # .desktop entry + icon so `scripts/linux-set-default.sh` can register PhotoViewer via xdg-mime.
+    include(GNUInstallDirs)
+    set(PHOTOVIEWER_BIN "${CMAKE_INSTALL_FULL_BINDIR}/PhotoViewer")
+    configure_file(${CMAKE_SOURCE_DIR}/cmake/photoviewer.desktop.in ${CMAKE_BINARY_DIR}/photoviewer.desktop @ONLY)
+    install(FILES ${CMAKE_BINARY_DIR}/photoviewer.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+    install(FILES ${CMAKE_SOURCE_DIR}/cmake/AppIcon.png    # scripts/make_icon.py
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps RENAME photoviewer.png)
+    # CMAKE_INSTALL_PREFIX is re-evaluated when this runs, so a `cmake --install --prefix ...`
+    # or DESTDIR-staged install still targets its own applications dir, not the configure-time one.
+    install(CODE "
+        find_program(PHOTOVIEWER_UPDATE_DESKTOP_DB update-desktop-database)
+        if(PHOTOVIEWER_UPDATE_DESKTOP_DB)
+            execute_process(COMMAND \"\${PHOTOVIEWER_UPDATE_DESKTOP_DB}\"
+                \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/applications\")
+        endif()
+    ")
+endif()
