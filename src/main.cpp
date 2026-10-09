@@ -10,6 +10,9 @@
 #include <rlImGui.h>
 #include <rlgl.h>
 
+#include <opencv2/imgproc.hpp>
+#include <opencv2/video/tracking.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -19,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -35,6 +39,30 @@ struct View {
     float scale = 1;        // screen points per image pixel
     bool fitted = false;
     bool autoFit = true;    // scale tracks canvas size (e.g. window resize) until a manual zoom/pan
+};
+
+// Dense optical flow from the previous image in the list to the current one.
+struct FlowResult {
+    cv::Mat flow;      // CV_32FC2, per-pixel (dx, dy) at `scale` × the current image's resolution
+    cv::Mat mag, ang;  // CV_32F magnitude in image pixels, direction in degrees (0 = +x, 90 = +y / down)
+    float scale = 1;   // flow pixels per image pixel
+    float maxMag = 0;  // in image pixels
+    float p99Mag = 0;  // 99th percentile magnitude, the automatic colour range
+};
+
+enum FlowMode { FlowDirection, FlowMagnitude };
+
+struct Flow {
+    const LoadedData* from = nullptr;  // inputs of the current/pending result (change on reload)
+    const LoadedData* to = nullptr;
+    std::future<FlowResult> pending;
+    FlowResult res;
+    const LoadedData* resFrom = nullptr;  // inputs `res` was computed from
+    const LoadedData* resTo = nullptr;
+    Texture2D tex{};
+    bool hasTex = false;
+    int texMode = -1;  // visualisation the texture was built with
+    float texRange = 0;
 };
 
 struct App {
@@ -64,6 +92,18 @@ struct App {
     bool roiDragging = false;
     ImGuiMouseButton roiButton = ImGuiMouseButton_Right;
     double roiX0 = 0, roiY0 = 0;
+
+    bool blend = false;      // cross-fade the two open images (only offered with exactly two)
+    float blendT = 0.5f;     // 0 = first image, 1 = second
+    bool showFlow = false;   // optical flow from the previous image to the current one
+    bool flowArrows = true;
+    float flowAlpha = 0.6f;
+    int flowMode = FlowDirection;
+    bool flowAutoRange = true;  // colour range = 99th percentile magnitude
+    float flowRange = 10;       // manual colour range, image pixels
+    float arrowScale = 1;       // arrow length multiplier
+    float arrowSpacing = 28;    // screen points between arrows
+    Flow flow;
 
     Texture2D checker{};
     double lastWatch = 0;
@@ -326,6 +366,161 @@ void ensureDisplaySettings(App& a, ImageDoc& d)
     uploadTexture(d);
 }
 
+// ----------------------------------------------------------------------------
+// Blend / optical flow
+// ----------------------------------------------------------------------------
+
+bool canBlend(const App& a) { return a.docs.size() == 2; }
+
+bool docReady(const ImageDoc& d) { return d.data && d.data->ok && d.hasTex; }
+
+// Inputs for flow: previous image in the list -> current one, or false if unavailable.
+bool flowInputs(App& a, const LoadedData*& from, const LoadedData*& to)
+{
+    if (!a.showFlow || a.current < 1 || a.current >= int(a.docs.size())) return false;
+    const ImageDoc& p = *a.docs[a.current - 1];
+    const ImageDoc& c = *a.docs[a.current];
+    if (!p.data || !p.data->ok || !c.data || !c.data->ok) return false;
+    from = p.data.get();
+    to = c.data.get();
+    return true;
+}
+
+// 8-bit grayscale at w×h, mapped by the depth's nominal range so brightness is comparable between frames.
+cv::Mat flowGray(const cv::Mat& m, int w, int h)
+{
+    cv::Mat f, g;
+    m.convertTo(f, CV_32F);
+    if (f.channels() == 3) cv::cvtColor(f, g, cv::COLOR_BGR2GRAY);
+    else if (f.channels() == 4) cv::cvtColor(f, g, cv::COLOR_BGRA2GRAY);
+    else if (f.channels() == 2) cv::extractChannel(f, g, 0);
+    else g = f;
+    double lo, hi;
+    nominalRange(m.depth(), lo, hi);
+    cv::Mat g8;
+    g.convertTo(g8, CV_8U, 255.0 / (hi - lo), -lo * 255.0 / (hi - lo));
+    if (g8.cols != w || g8.rows != h) cv::resize(g8, g8, cv::Size(w, h), 0, 0, cv::INTER_AREA);
+    return g8;
+}
+
+FlowResult computeFlow(cv::Mat prev, cv::Mat cur)
+{
+    constexpr int kMaxSide = 1024;  // Farneback is slow; flow is smooth enough to compute downscaled
+    FlowResult r;
+    r.scale = std::min(1.0f, float(kMaxSide) / std::max(cur.cols, cur.rows));
+    const int w = std::max(1, int(std::lround(cur.cols * r.scale)));
+    const int h = std::max(1, int(std::lround(cur.rows * r.scale)));
+    cv::calcOpticalFlowFarneback(flowGray(prev, w, h), flowGray(cur, w, h), r.flow, 0.5, 5, 15, 3, 5, 1.2, 0);
+
+    cv::Mat xy[2];
+    cv::split(r.flow, xy);
+    cv::cartToPolar(xy[0], xy[1], r.mag, r.ang, true);
+    r.mag *= 1.0 / r.scale;
+    // The 99th percentile is the default colour range, so a few outliers don't wash everything out.
+    std::vector<float> m(r.mag.begin<float>(), r.mag.end<float>());
+    auto k = m.begin() + std::ptrdiff_t(m.size() * 0.99);
+    std::nth_element(m.begin(), k, m.end());
+    r.p99Mag = std::max(*k, 1e-3f);
+    double mx;
+    cv::minMaxLoc(r.mag, nullptr, &mx);
+    r.maxMag = float(mx);
+    return r;
+}
+
+float flowColorRange(const App& a, const FlowResult& r) { return a.flowAutoRange ? r.p99Mag : std::max(a.flowRange, 1e-3f); }
+
+// Flow visualisation as RGBA: direction (hue = angle, brightness = magnitude) or magnitude (Turbo colormap).
+cv::Mat flowRGBA(const FlowResult& r, int mode, float range)
+{
+    cv::Mat rgb, rgba;
+    if (mode == FlowMagnitude) {
+        cv::Mat m8, bgr;
+        r.mag.convertTo(m8, CV_8U, 255.0 / range);
+        cv::applyColorMap(m8, bgr, cv::COLORMAP_TURBO);
+        cv::cvtColor(bgr, rgba, cv::COLOR_BGR2RGBA);
+        return rgba;
+    }
+    cv::Mat hsv[3], hsvImg;
+    r.ang.convertTo(hsv[0], CV_8U, 0.5);  // OpenCV 8-bit hue is 0..180
+    hsv[1] = cv::Mat(r.mag.size(), CV_8U, cv::Scalar(255));
+    r.mag.convertTo(hsv[2], CV_8U, 255.0 / range);
+    cv::merge(hsv, 3, hsvImg);
+    cv::cvtColor(hsvImg, rgb, cv::COLOR_HSV2RGB);
+    cv::cvtColor(rgb, rgba, cv::COLOR_RGB2RGBA);
+    return rgba;
+}
+
+// Turbo colormap sampled for the legend, index 0..255.
+const std::vector<ImU32>& turboLut()
+{
+    static std::vector<ImU32> lut;
+    if (lut.empty()) {
+        cv::Mat ramp(1, 256, CV_8U), bgr;
+        for (int i = 0; i < 256; ++i) ramp.at<uchar>(i) = uchar(i);
+        cv::applyColorMap(ramp, bgr, cv::COLORMAP_TURBO);
+        for (int i = 0; i < 256; ++i) {
+            const cv::Vec3b c = bgr.at<cv::Vec3b>(i);
+            lut.push_back(IM_COL32(c[2], c[1], c[0], 255));
+        }
+    }
+    return lut;
+}
+
+// Collects finished flow results and starts a new computation when the inputs changed.
+void updateFlow(App& a)
+{
+    Flow& f = a.flow;
+    if (f.pending.valid() && f.pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        f.res = f.pending.get();
+        f.resFrom = f.from;
+        f.resTo = f.to;
+        f.texMode = -1;
+    }
+    // (Re)build the texture when the result or the visualisation settings changed.
+    if (f.resTo && !f.res.mag.empty()) {
+        const float range = flowColorRange(a, f.res);
+        if (f.texMode != a.flowMode || f.texRange != range) {
+            const cv::Mat rgba = flowRGBA(f.res, a.flowMode, range);
+            if (f.hasTex && f.tex.width == rgba.cols && f.tex.height == rgba.rows) {
+                UpdateTexture(f.tex, rgba.data);
+            } else {
+                if (f.hasTex) UnloadTexture(f.tex);
+                Image img{rgba.data, rgba.cols, rgba.rows, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                f.tex = LoadTextureFromImage(img);
+                rlTextureParameters(f.tex.id, RL_TEXTURE_MIN_FILTER, RL_TEXTURE_FILTER_LINEAR);
+                rlTextureParameters(f.tex.id, RL_TEXTURE_MAG_FILTER, RL_TEXTURE_FILTER_LINEAR);
+                f.hasTex = true;
+            }
+            f.texMode = a.flowMode;
+            f.texRange = range;
+        }
+    }
+    const LoadedData *from, *to;
+    if (f.pending.valid() || !flowInputs(a, from, to) || (from == f.from && to == f.to)) return;
+    f.from = from;
+    f.to = to;
+    f.pending = std::async(std::launch::async, computeFlow, from->mat, to->mat);  // Mats share (ref-counted) pixels
+}
+
+// The flow result for the current pair, if it has been computed.
+const FlowResult* activeFlow(App& a)
+{
+    const LoadedData *from, *to;
+    if (!flowInputs(a, from, to) || !a.flow.hasTex || a.flow.resFrom != from || a.flow.resTo != to) return nullptr;
+    return &a.flow.res;
+}
+
+// Flow at image pixel (x, y) in image pixels.
+bool flowAt(const FlowResult& r, double x, double y, float& dx, float& dy)
+{
+    const int fx = int(x * r.scale), fy = int(y * r.scale);
+    if (fx < 0 || fy < 0 || fx >= r.flow.cols || fy >= r.flow.rows) return false;
+    const cv::Vec2f v = r.flow.at<cv::Vec2f>(fy, fx);
+    dx = v[0] / r.scale;
+    dy = v[1] / r.scale;
+    return true;
+}
+
 void watchFiles(App& a)
 {
     if (!a.autoReload || GetTime() - a.lastWatch < 1.0) return;
@@ -536,6 +731,129 @@ void drawLoupe(App& a, const ImageDoc& d, int hx, int hy)
     ImGui::EndTooltip();
 }
 
+// Colour key for the flow overlay: a direction wheel or a magnitude colour bar, labelled in image pixels.
+void drawFlowLegend(const App& a, const FlowResult& r)
+{
+    const float range = flowColorRange(a, r);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 textCol = ImGui::GetColorU32(ImGuiCol_Text), dimCol = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    const float fs = ImGui::GetFontSize();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+
+    if (a.flowMode == FlowMagnitude) {
+        const float barH = fs * 0.9f;
+        const auto& lut = turboLut();
+        const int seg = 64;
+        for (int i = 0; i < seg; ++i) {
+            const float x0 = p.x + w * i / seg, x1 = p.x + w * (i + 1) / seg;
+            const ImU32 c0 = lut[i * 255 / seg], c1 = lut[(i + 1) * 255 / seg];
+            dl->AddRectFilledMultiColor(ImVec2(x0, p.y), ImVec2(x1, p.y + barH), c0, c1, c1, c0);
+        }
+        dl->AddRect(p, ImVec2(p.x + w, p.y + barH), IM_COL32(0, 0, 0, 160));
+        // Ticks at 0, 1/4, ..., 1 of the range.
+        for (int t = 0; t <= 4; ++t) {
+            char b[32];
+            std::snprintf(b, sizeof b, t == 4 ? "%.3g px" : "%.3g", range * t / 4);
+            const float x = p.x + w * t / 4;
+            const float tw = ImGui::CalcTextSize(b).x;
+            const float tx = std::clamp(x - tw / 2, p.x, p.x + w - tw);
+            dl->AddLine(ImVec2(x, p.y + barH), ImVec2(x, p.y + barH + 3), dimCol);
+            dl->AddText(ImVec2(tx, p.y + barH + 3), textCol, b);
+        }
+        ImGui::Dummy(ImVec2(w, barH + 3 + fs));
+        ImGui::TextDisabled("|flow|, values above the range are clipped");
+        return;
+    }
+
+    // Direction wheel: hue = direction the pixel moved (screen orientation, y down), brightness = magnitude.
+    const float R = fs * 2.2f;
+    const ImVec2 c(p.x + R + 2, p.y + R + 2);
+    const int rings = 6, sectors = 48;
+    for (int ri = 0; ri < rings; ++ri)
+        for (int si = 0; si < sectors; ++si) {
+            const float r0 = R * ri / rings, r1 = R * (ri + 1) / rings;
+            const float a0 = 2 * IM_PI * si / sectors, a1 = 2 * IM_PI * (si + 1) / sectors;
+            float cr, cg, cb;
+            ImGui::ColorConvertHSVtoRGB((si + 0.5f) / sectors, 1, (ri + 0.5f) / rings, cr, cg, cb);
+            const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(cr, cg, cb, 1));
+            const ImVec2 q[4] = {{c.x + r0 * std::cos(a0), c.y + r0 * std::sin(a0)}, {c.x + r1 * std::cos(a0), c.y + r1 * std::sin(a0)},
+                                 {c.x + r1 * std::cos(a1), c.y + r1 * std::sin(a1)}, {c.x + r0 * std::cos(a1), c.y + r0 * std::sin(a1)}};
+            dl->AddConvexPolyFilled(q, 4, col);
+        }
+    dl->AddCircle(c, R, IM_COL32(0, 0, 0, 160), 48);
+    ImGui::Dummy(ImVec2(2 * R + 4, 2 * R + 4));
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted("hue = direction of motion");
+    ImGui::TextDisabled("right red · down yellow-green");
+    ImGui::TextDisabled("left cyan · up blue-violet");
+    ImGui::Text("brightness = |flow|, full at %.3g px", range);
+    ImGui::EndGroup();
+}
+
+// Floating controls at the bottom of the canvas for blend / flow.
+void drawComparePanel(App& a, ImVec2 anchor, float canvasW)
+{
+    const bool blend = a.blend && canBlend(a);
+    const bool flow = a.showFlow && a.docs.size() >= 2;
+    if (!blend && !flow) return;
+    ImGui::SetNextWindowPos(anchor, ImGuiCond_Always, ImVec2(0.5f, 1));
+    ImGui::SetNextWindowSize(ImVec2(std::min(420.0f, canvasW - 24), 0));
+    ImGui::SetNextWindowBgAlpha(0.8f);
+    const ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize;
+    if (!ImGui::Begin("##compare", nullptr, fl)) { ImGui::End(); return; }
+    const float w = ImGui::GetContentRegionAvail().x;
+    if (blend) {
+        const std::string& na = a.docs[0]->name;
+        const std::string& nb = a.docs[1]->name;
+        ImGui::TextUnformatted(na.c_str());
+        const float tw = ImGui::CalcTextSize(nb.c_str()).x;
+        ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetCursorPosX() + w - tw));
+        ImGui::TextUnformatted(nb.c_str());
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderFloat("##blend", &a.blendT, 0, 1, "blend %.2f");
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) a.blendT = 0.5f;
+    }
+    if (flow) {
+        if (blend) ImGui::Separator();
+        if (a.current < 1) ImGui::TextDisabled("Optical flow: first image has no previous frame");
+        else {
+            ImGui::Text("Flow  %s -> %s", a.docs[a.current - 1]->name.c_str(), a.docs[a.current]->name.c_str());
+            if (const FlowResult* r = activeFlow(a)) ImGui::TextDisabled("max %.1f px · p99 %.1f px · computed at %.0f%%", r->maxMag, r->p99Mag, r->scale * 100);
+            else ImGui::TextDisabled("computing…");
+        }
+        ImGui::RadioButton("Direction", &a.flowMode, FlowDirection);
+        ImGui::SameLine();
+        ImGui::RadioButton("Magnitude", &a.flowMode, FlowMagnitude);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderFloat("##flowalpha", &a.flowAlpha, 0, 1, "opacity %.2f");
+
+        ImGui::Checkbox("Auto range", &a.flowAutoRange);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Colour range = 99th percentile magnitude");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(a.flowAutoRange);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderFloat("##flowrange", &a.flowRange, 0.1f, 500, "range %.1f px", ImGuiSliderFlags_Logarithmic);
+        ImGui::EndDisabled();
+        if (const FlowResult* r = activeFlow(a)) drawFlowLegend(a, *r);
+
+        ImGui::Checkbox("Arrows", &a.flowArrows);
+        ImGui::BeginDisabled(!a.flowArrows);
+        const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2;
+        ImGui::SetNextItemWidth(half);
+        ImGui::SliderFloat("##arrowscale", &a.arrowScale, 0.1f, 50, "length ×%.2f", ImGuiSliderFlags_Logarithmic);
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) a.arrowScale = 1;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(half);
+        ImGui::SliderFloat("##arrowspacing", &a.arrowSpacing, 8, 160, "spacing %.0f pt", ImGuiSliderFlags_Logarithmic);
+        ImGui::EndDisabled();
+    }
+    ImGui::End();
+}
+
 void drawViewer(App& a)
 {
     ImGuiWindowClass wc;
@@ -634,10 +952,24 @@ void drawViewer(App& a)
         }
 
         // ---- image ----
+        // Each image is drawn at its own pixel size from the origin, so pixel coordinates line up.
+        auto drawDoc = [&](const ImageDoc& doc, float alpha) {
+            const ImVec2 q0 = toScreen(0, 0), q1 = toScreen(doc.data->mat.cols, doc.data->mat.rows);
+            const ImU32 tint = IM_COL32(255, 255, 255, int(alpha * 255 + 0.5f));
+            if (alpha >= 1 && (doc.data->mat.channels() == 2 || doc.data->mat.channels() == 4))
+                dl->AddImage(texId(a.checker), q0, q1, ImVec2(0, 0), ImVec2((q1.x - q0.x) / 16, (q1.y - q0.y) / 16));
+            dl->AddImage(texId(doc.tex), q0, q1, ImVec2(0, 0), ImVec2(1, 1), tint);
+        };
         const ImVec2 i0 = toScreen(0, 0), i1 = toScreen(W, H);
-        if (mat.channels() == 2 || mat.channels() == 4)
-            dl->AddImage(texId(a.checker), i0, i1, ImVec2(0, 0), ImVec2((i1.x - i0.x) / 16, (i1.y - i0.y) / 16));
-        dl->AddImage(texId(d->tex), i0, i1);
+        if (a.blend && canBlend(a) && docReady(*a.docs[0]) && docReady(*a.docs[1])) {
+            for (auto& sp : a.docs) ensureDisplaySettings(a, *sp);
+            drawDoc(*a.docs[0], 1);
+            drawDoc(*a.docs[1], a.blendT);
+        } else {
+            drawDoc(*d, 1);
+        }
+        const FlowResult* flow = activeFlow(a);
+        if (flow && a.flowAlpha > 0) dl->AddImage(texId(a.flow.tex), i0, i1, ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, int(a.flowAlpha * 255 + 0.5f)));
 
         // Visible pixel range.
         double vx0, vy0, vx1, vy1;
@@ -651,6 +983,30 @@ void drawViewer(App& a)
             for (int x = gx0; x <= gx1; ++x) dl->AddLine(toScreen(x, gy0), toScreen(x, gy1), IM_COL32(128, 128, 128, 60));
         if (a.showGrid && s >= 12)
             for (int y = gy0; y <= gy1; ++y) dl->AddLine(toScreen(gx0, y), toScreen(gx1, y), IM_COL32(128, 128, 128, 60));
+
+        // Flow vectors on a coarse grid (spacing fixed in screen points).
+        if (flow && a.flowArrows) {
+            const int step = std::max(1, int(std::ceil(a.arrowSpacing / s)));
+            if (double(gx1 - gx0) * (gy1 - gy0) / (double(step) * step) < 20000)
+                for (int y = gy0 - gy0 % step + step / 2; y < gy1; y += step)
+                    for (int x = gx0 - gx0 % step + step / 2; x < gx1; x += step) {
+                        float fx, fy;
+                        if (!flowAt(*flow, x + 0.5, y + 0.5, fx, fy)) continue;
+                        const ImVec2 o = toScreen(x + 0.5, y + 0.5), e = toScreen(x + 0.5 + fx * a.arrowScale, y + 0.5 + fy * a.arrowScale);
+                        const float len = std::hypot(e.x - o.x, e.y - o.y);
+                        if (len < 1.5f) { dl->AddRectFilled(ImVec2(o.x - 1, o.y - 1), ImVec2(o.x + 1, o.y + 1), IM_COL32(255, 255, 255, 140)); continue; }
+                        const float ux = (e.x - o.x) / len, uy = (e.y - o.y) / len, hl = std::min(6.0f, len * 0.4f);
+                        const ImVec2 h1(e.x - hl * (ux - uy * 0.5f), e.y - hl * (uy + ux * 0.5f));
+                        const ImVec2 h2(e.x - hl * (ux + uy * 0.5f), e.y - hl * (uy - ux * 0.5f));
+                        for (int pass = 0; pass < 2; ++pass) {
+                            const ImU32 col = pass ? IM_COL32(255, 255, 255, 230) : IM_COL32(0, 0, 0, 160);
+                            const float th = pass ? 1.2f : 3.0f;
+                            dl->AddLine(o, e, col, th);
+                            dl->AddLine(e, h1, col, th);
+                            dl->AddLine(e, h2, col, th);
+                        }
+                    }
+        }
 
         // Pixel values printed inside cells at high zoom.
         if (a.showValues) {
@@ -708,6 +1064,7 @@ void drawViewer(App& a)
     if (ready && a.showLoupe && io.KeyShift && a.hoverValid && !active && !a.roiDragging) drawLoupe(a, *d, a.hoverX, a.hoverY);
 
     ImGui::End();
+    drawComparePanel(a, ImVec2(cc.x, p1.y - 12), csz.x);
 }
 
 std::vector<MetaEntry> metadataRows(const ImageDoc& d)
@@ -817,6 +1174,11 @@ void drawInfoTab(App& a)
 
     if (a.hoverValid) pixelCompact(a, *d, a.hoverX, a.hoverY, "@");
     else ImGui::TextDisabled("hover image");
+    if (const FlowResult* fr = activeFlow(a); fr && a.hoverValid) {
+        float fx, fy;
+        if (flowAt(*fr, a.hoverX + 0.5, a.hoverY + 0.5, fx, fy))
+            ImGui::Text("flow %+.2f %+.2f  |%.2f|", fx, fy, std::hypot(fx, fy));
+    }
     if (a.pinValid) {
         ImGui::Spacing();
         pixelCompact(a, *d, a.pinX, a.pinY, "pin");
@@ -964,6 +1326,9 @@ void drawMenuBar(App& a)
             ImGui::EndMenu();
         }
         ImGui::Separator();
+        ImGui::MenuItem("Blend two images", "B", &a.blend, canBlend(a));
+        ImGui::MenuItem("Optical flow from previous", "O", &a.showFlow, a.docs.size() >= 2);
+        ImGui::Separator();
         ImGui::MenuItem("Pixel grid", "G", &a.showGrid);
         ImGui::MenuItem("Values in cells", "V", &a.showValues);
         if (ImGui::BeginMenu("Loupe (hold Shift)")) {
@@ -1018,6 +1383,7 @@ void drawMenuBar(App& a)
             "Left / Right         previous / next",
             "N  normalize   C  channel",
             "G  grid        V  cell values",
+            "B  blend (2 images)   O  optical flow",
             "R  reload      Del  close",
         };
         for (const char* l : lines) ImGui::TextUnformatted(l);
@@ -1063,6 +1429,8 @@ void handleShortcuts(App& a)
     if (pressed(ImGuiKey_N)) a.disp.normalize = !a.disp.normalize;
     if (pressed(ImGuiKey_C)) a.disp.channel = (a.disp.channel + 1) % 5;
     if (pressed(ImGuiKey_G)) a.showGrid = !a.showGrid;
+    if (pressed(ImGuiKey_B) && canBlend(a)) a.blend = !a.blend;
+    if (pressed(ImGuiKey_O) && a.docs.size() >= 2) a.showFlow = !a.showFlow;
     if (pressed(ImGuiKey_V)) a.showValues = !a.showValues;
     if (pressed(ImGuiKey_R) && d) reload(a, *d);
     if (pressed(ImGuiKey_Escape)) {
@@ -1162,6 +1530,7 @@ int main(int argc, char** argv)
         pollDocs(a);
         a.pinch = macConsumeMagnify();
         watchFiles(a);
+        updateFlow(a);
 
         std::string title = "PhotoViewer";
         if (ImageDoc* d = currentDoc(a)) title = d->name + " — PhotoViewer";
@@ -1205,6 +1574,8 @@ int main(int argc, char** argv)
         if (d->hasTex) UnloadTexture(d->tex);
     a.docs.clear();
     a.loader.reset();
+    if (a.flow.pending.valid()) a.flow.pending.wait();
+    if (a.flow.hasTex) UnloadTexture(a.flow.tex);
     UnloadTexture(a.checker);
     rlImGuiShutdown();
     CloseWindow();
